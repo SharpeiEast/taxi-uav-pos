@@ -1,0 +1,9 @@
+{
+  "n_cells_sampled": 1624,
+  "se_ratio_day_over_vehicle": {
+    "p10": 0.543,
+    "p50": 0.951,
+    "p90": 1.211
+  },
+  "note": "ratio ~1 => vehicle clustering already captures the dependence"
+}

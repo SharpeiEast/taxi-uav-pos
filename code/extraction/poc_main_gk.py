@@ -1,0 +1,1185 @@
+"""
+PoC: Empirical Positioning Uncertainty Extraction from Taxi GPS Data
+======================================================================
+
+Purpose:
+    For each Chinese city's one-day taxi GPS dataset, this script:
+    1. Reads all parquet files in city_data/<city_name>/
+    2. Identifies stationary segments (parked taxis)
+    3. Computes per-segment positioning uncertainty (sigma_pos)
+    4. Aggregates spatially (100m, 250m grids) and temporally (6 time bins)
+    5. Outputs everything we need to continue the research without re-running
+
+Workflow:
+    coding/poc_main.py  -->  city_data/<city>/  -->  output/poc_<city>/
+
+Run:
+    python poc_main.py --city beijing
+    python poc_main.py --city beijing --data-root /path/to/city_data --out-root /path/to/output
+
+Author: [Your Team]
+"""
+
+import argparse
+import gc
+import json
+import logging
+import os
+import shutil
+import sys
+import warnings
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+# Try to import psutil for memory monitoring; not required
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
+
+# Plotting (saved to file, no display needed)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
+
+# ============================================================
+# CONFIGURATION (v2 - tuned based on diagnostic findings)
+# ============================================================
+
+# Stationary segment detection
+SPEED_THRESHOLD_KMH = 2.0          # speed below this = potentially stationary
+MIN_SEGMENT_DURATION_S = 180       # minimum 3 minutes (was 5min - too strict)
+MAX_SEGMENT_DISPLACEMENT_M = 50    # was 30m, slightly relaxed
+MIN_POINTS_PER_SEGMENT = 8         # was 10, relaxed for shorter sampling intervals
+MAX_TIME_GAP_WITHIN_SEGMENT_S = 120  # gaps > 2 min split a segment
+
+# v2 NEW: coordinate diversity filter (the most important addition)
+# Diagnostic showed many segments have unique_coords/n_points < 0.3, indicating
+# map-matching artifacts. We require segments to preserve coordinate variation.
+MIN_UNIQUENESS_RATIO = 0.5        # at least 50% of points must have distinct coords
+MIN_UNIQUE_COORDS = 5             # at least 5 distinct (lon, lat) pairs
+
+# v2 NEW: long-segment splitting
+# Long stops (>15min) often have map-matching kicked in part-way through.
+# Split them into chunks and evaluate each separately.
+MAX_SEGMENT_DURATION_S = 900       # 15 minutes; split longer segments
+SUBSEGMENT_DURATION_S = 600        # split into 10-minute sub-segments
+
+# Spatial aggregation grids (in meters)
+GRID_SIZES_M = [50, 100, 250]     # main analysis: 100m. 50m & 250m for sensitivity check
+
+# Temporal binning (6 bins, 4 hours each)
+TIME_BINS = [(0, 4), (4, 8), (8, 12), (12, 16), (16, 20), (20, 24)]
+TIME_BIN_LABELS = ["00-04", "04-08", "08-12", "12-16", "16-20", "20-24"]
+
+# Earth constants for lat/lon to meter conversion
+M_PER_DEG_LAT = 111320.0           # approximate, varies <1% by latitude
+
+# Diagnostic / sanity-check thresholds
+SIGMA_POS_REASONABLE_RANGE_M = (0.1, 100.0)
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+def setup_logger(out_dir: Path):
+    """Set up a logger that writes both to stdout and to a file in output."""
+    log_path = out_dir / "run.log"
+    logger = logging.getLogger("poc")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
+                             datefmt="%H:%M:%S")
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    return logger
+
+
+# ============================================================
+# DATA LOADING
+# ============================================================
+
+def _mem_mb():
+    """Return current process memory in MB, or None if psutil not available."""
+    if not _HAS_PSUTIL:
+        return None
+    try:
+        return psutil.Process().memory_info().rss / (1024 ** 2)
+    except Exception:
+        return None
+
+
+def find_parquet_files(city_dir: Path):
+    """Find parquet files in a city directory.
+
+    Searches both the directory itself and any subdirectories (rglob).
+    This is robust to whether HKUST organizes data as
+        city_data/beijing/*.parquet (flat, multiple files)
+    or
+        city_data/beijing/2019-10-14/*.parquet (per-day subfolders)
+    """
+    files = sorted(set(city_dir.rglob("*.parquet")))
+    return files
+
+
+def load_one_file(path: Path) -> pd.DataFrame:
+    """Read and clean a single parquet file (without sorting).
+
+    Sorting happens later, per-vehicle, in the streaming pipeline.
+    """
+    df = pd.read_parquet(path)
+
+    # Type coercion
+    df["gps_time"] = pd.to_datetime(df["gps_time"], errors="coerce")
+    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+    df["speed_kmh"] = pd.to_numeric(df["speed_kmh"], errors="coerce")
+
+    # Drop bad rows
+    df = df.dropna(subset=["vehicle_id", "lon", "lat", "speed_kmh", "gps_time"])
+    df = df[(df["lon"] > 70) & (df["lon"] < 140) &
+            (df["lat"] > 15) & (df["lat"] < 55)]
+    df = df[(df["speed_kmh"] >= 0) & (df["speed_kmh"] < 200)]
+    return df
+
+
+def load_city_data(city_dir: Path, logger) -> pd.DataFrame:
+    """Read all parquet files in a city directory recursively, concat them.
+
+    For LARGE multi-day data (e.g. 7 days = 100M+ records), prefer using
+    `iter_vehicle_chunks` instead of this function — it processes data
+    in vehicle-id chunks to keep memory bounded.
+
+    Expected schema (based on the sample data):
+        vehicle_id, lon, lat, speed_kmh, heading, status, gps_time, ...
+    """
+    files = find_parquet_files(city_dir)
+    if not files:
+        raise FileNotFoundError(f"No parquet files found in {city_dir} (recursive)")
+    logger.info(f"Found {len(files)} parquet files in {city_dir} (recursive)")
+
+    dfs = []
+    n_total_pre = 0
+    for i, f in enumerate(files):
+        df = load_one_file(f)
+        n_total_pre += len(df)
+        dfs.append(df)
+        mem = _mem_mb()
+        mem_str = f", mem={mem:.0f}MB" if mem else ""
+        logger.info(f"  [{i+1}/{len(files)}] {f.name}: {len(df):,} valid rows"
+                    f"{mem_str}")
+
+    df = pd.concat(dfs, ignore_index=True)
+    del dfs
+    gc.collect()
+
+    df = df.sort_values(["vehicle_id", "gps_time"]).reset_index(drop=True)
+    logger.info(f"Total records after cleaning & concat: {len(df):,}")
+    logger.info(f"Unique vehicles: {df['vehicle_id'].nunique():,}")
+    logger.info(f"Time range: {df['gps_time'].min()} -> {df['gps_time'].max()}")
+    logger.info(f"Spatial extent: lon [{df['lon'].min():.4f}, {df['lon'].max():.4f}], "
+                f"lat [{df['lat'].min():.4f}, {df['lat'].max():.4f}]")
+    return df
+
+
+def estimate_dataset_size(city_dir: Path, logger) -> dict:
+    """Quickly estimate dataset size to decide if we need streaming mode.
+
+    Reads first parquet file to get average row size, then extrapolates
+    from total file size on disk.
+    """
+    files = find_parquet_files(city_dir)
+    if not files:
+        return {"n_files": 0, "total_disk_mb": 0, "estimated_rows": 0}
+
+    total_disk = sum(f.stat().st_size for f in files)
+    # Sample first file to estimate rows-per-MB (compressed parquet is roughly 5-10x denser than memory)
+    sample = pd.read_parquet(files[0])
+    rows_per_disk_byte = len(sample) / files[0].stat().st_size
+    estimated_rows = int(total_disk * rows_per_disk_byte)
+
+    info = {
+        "n_files": len(files),
+        "total_disk_mb": total_disk / (1024**2),
+        "estimated_rows": estimated_rows,
+        "estimated_mem_gb_full_load": estimated_rows * 200 / (1024**3),  # ~200B/row in pandas
+    }
+    logger.info(f"Dataset size estimate: {info['n_files']} files, "
+                f"{info['total_disk_mb']:.0f} MB on disk, "
+                f"~{info['estimated_rows']:,} rows, "
+                f"~{info['estimated_mem_gb_full_load']:.1f} GB mem if full-loaded")
+    return info
+
+
+# ============================================================
+# STATIONARY SEGMENT DETECTION
+# ============================================================
+
+def detect_stationary_segments(df: pd.DataFrame, logger) -> pd.DataFrame:
+    """Identify stationary segments per vehicle.
+
+    A stationary segment is a maximal run of consecutive records (per vehicle,
+    sorted by time) where speed <= SPEED_THRESHOLD_KMH and consecutive time
+    gap < MAX_TIME_GAP.
+
+    Returns a long-format DataFrame with one row per (segment, point inside segment).
+    """
+    logger.info("Detecting stationary segments...")
+
+    # Ensure sorted (defensive — caller already sorts but be sure)
+    df = df.sort_values(["vehicle_id", "gps_time"]).reset_index(drop=True)
+    df["is_slow"] = df["speed_kmh"] <= SPEED_THRESHOLD_KMH
+
+    # Compute time gap to previous record (per vehicle)
+    df["prev_time"] = df.groupby("vehicle_id")["gps_time"].shift(1)
+    df["dt_s"] = (df["gps_time"] - df["prev_time"]).dt.total_seconds()
+
+    # Build segment_id using a numpy-based approach that's easy to verify.
+    # A segment continues if: same vehicle AND current is_slow AND prev was slow
+    #                          AND time gap is small.
+    # Otherwise a new boundary is drawn.
+    n = len(df)
+    is_slow = df["is_slow"].to_numpy()
+    vehicle = df["vehicle_id"].to_numpy()
+    dt_s = df["dt_s"].to_numpy()
+
+    # An "in-segment continuation" condition:
+    #   row i extends segment of row i-1 iff:
+    #   - same vehicle as i-1
+    #   - i-1 was slow (so row i-1 belongs to a segment)
+    #   - i is slow
+    #   - time gap is OK
+    continues = np.zeros(n, dtype=bool)
+    if n > 1:
+        same_vehicle = (vehicle[1:] == vehicle[:-1])
+        prev_slow = is_slow[:-1]
+        cur_slow = is_slow[1:]
+        small_gap = np.nan_to_num(dt_s[1:], nan=1e9) <= MAX_TIME_GAP_WITHIN_SEGMENT_S
+        continues[1:] = same_vehicle & prev_slow & cur_slow & small_gap
+
+    # Segment ID: increments at every "non-continuation among slow rows"
+    # i.e., a new segment begins at every slow row that does NOT continue from previous slow row.
+    new_segment_starts = is_slow & ~continues
+    segment_id_full = np.where(new_segment_starts, 1, 0).cumsum()
+    # Non-slow rows: segment_id = -1
+    segment_id_full = np.where(is_slow, segment_id_full, -1)
+    df["segment_id"] = segment_id_full
+
+    # Filter to only segment rows
+    seg_df = df[df["segment_id"] >= 0].copy()
+    n_segments = seg_df["segment_id"].nunique() if len(seg_df) > 0 else 0
+    logger.info(f"  Slow-speed points: {len(seg_df):,}")
+    logger.info(f"  Provisional segments: {n_segments:,}")
+
+    return seg_df
+
+
+# ============================================================
+# SIGMA_POS COMPUTATION
+# ============================================================
+
+def compute_segment_sigma_pos(seg_df: pd.DataFrame, logger) -> tuple:
+    """For each stationary segment, compute sigma_pos (positioning uncertainty).
+
+    v2 changes:
+    - Splits long segments (>15 min) into 10-min sub-segments.
+    - Adds uniqueness_ratio filter.
+    - Tracks why each segment was rejected (filter funnel statistics).
+
+    v3 changes (PERFORMANCE):
+    - Pre-filter pass: vectorized n_points/duration check eliminates ~95-99%
+      of segments before any expensive per-segment work.
+    - The remaining segments are processed in a Python loop, but the loop is
+      now O(survivors) instead of O(all_provisional). For Wuhan-scale data
+      (5.6M provisional segments), this drops runtime from ~90 min to a few
+      minutes.
+
+    sigma_pos uses MAD-based estimator:
+        sigma_pos = sqrt(MAD_x^2 + MAD_y^2) * 1.4826
+
+    REV-FIX(A1-GK): additionally emits sigma_gk = sqrt(lam_max) of the
+    Gnanadesikan-Kettenring robust 2x2 covariance (worst-direction per-axis
+    sigma, rotation-invariant), plus sigma_minor, rho_gk, theta_gk_deg.
+    Original sigma_pos_m column is kept unchanged for comparison.
+    """
+    logger.info("Computing per-segment sigma_pos (v3 vectorized pre-filter)...")
+
+    # Filter funnel counters
+    funnel = {
+        "total_provisional": 0,
+        "subsegments_created": 0,
+        "rejected_too_few_points": 0,
+        "rejected_too_short": 0,
+        "rejected_too_displaced": 0,
+        "rejected_low_uniqueness": 0,
+        "rejected_too_few_unique_coords": 0,
+        "passed_all_filters": 0,
+    }
+
+    # ----- STAGE 1: Vectorized pre-aggregate stats per segment -----
+    # Group once and compute n_points, t_min, t_max per segment using fast
+    # pandas built-ins. This is the key optimization: 99% of segments fail
+    # the n_points/duration check, and we filter them out without ever
+    # entering Python-level per-segment processing.
+    logger.info("  Stage 1: aggregating per-segment stats (vectorized)...")
+    agg = seg_df.groupby("segment_id", sort=False).agg(
+        n_points=("lon", "size"),
+        t_min=("gps_time", "min"),
+        t_max=("gps_time", "max"),
+    )
+    agg["duration_s"] = (agg["t_max"] - agg["t_min"]).dt.total_seconds()
+
+    n_total = len(agg)
+    funnel["total_provisional"] = int(n_total)
+    logger.info(f"    Total segments: {n_total:,}")
+
+    # ----- STAGE 2: Identify which segments need subsegmenting -----
+    # Long segments (> MAX_SEGMENT_DURATION_S) need to be split. Short ones
+    # go through as-is.
+    needs_split = agg["duration_s"] > MAX_SEGMENT_DURATION_S
+    n_to_split = int(needs_split.sum())
+    logger.info(f"    Segments to split (duration > {MAX_SEGMENT_DURATION_S}s): "
+                f"{n_to_split:,}")
+
+    # ----- STAGE 3: Fast pre-filter short segments (no splitting needed) -----
+    # Pre-filter on n_points and duration. Survivors go to the expensive loop.
+    short = agg[~needs_split].copy()
+    short["passes_basic"] = (
+        (short["n_points"] >= MIN_POINTS_PER_SEGMENT) &
+        (short["duration_s"] >= MIN_SEGMENT_DURATION_S)
+    )
+    n_short_pass = int(short["passes_basic"].sum())
+    n_short_reject_pts = int(((short["n_points"] < MIN_POINTS_PER_SEGMENT)).sum())
+    n_short_reject_dur = int(
+        ((short["n_points"] >= MIN_POINTS_PER_SEGMENT) &
+         (short["duration_s"] < MIN_SEGMENT_DURATION_S)).sum()
+    )
+    funnel["rejected_too_few_points"] += n_short_reject_pts
+    funnel["rejected_too_short"] += n_short_reject_dur
+
+    short_survivors = set(short[short["passes_basic"]].index.tolist())
+    logger.info(f"    Short segments passing n_pts+duration filter: "
+                f"{n_short_pass:,} (rejected {n_short_reject_pts:,} too few pts, "
+                f"{n_short_reject_dur:,} too short)")
+
+    # ----- STAGE 4: Find rows belonging to surviving segments + long segments -----
+    # These are the rows that need detailed processing.
+    keep_mask = (
+        seg_df["segment_id"].isin(short_survivors) |
+        seg_df["segment_id"].isin(set(agg[needs_split].index.tolist()))
+    )
+    work_df = seg_df.loc[keep_mask].copy()
+    logger.info(f"    Rows to process in detail: {len(work_df):,} "
+                f"(out of {len(seg_df):,} total slow-point rows)")
+
+    # ----- STAGE 5: Detailed processing loop for the survivors -----
+    rows = []
+    grouped = work_df.groupby("segment_id", sort=False)
+    n_processed = 0
+    n_survivors_total = len(grouped)
+    log_every = max(1, n_survivors_total // 20)  # log progress 20 times
+
+    for sid, g in grouped:
+        n_processed += 1
+        if n_processed % log_every == 0:
+            logger.info(f"    Progress: {n_processed:,}/{n_survivors_total:,} "
+                        f"({100*n_processed/n_survivors_total:.0f}%) "
+                        f"survivor segments processed, "
+                        f"{funnel['passed_all_filters']:,} accepted so far")
+
+        g = g.sort_values("gps_time").reset_index(drop=True)
+        full_duration = (g["gps_time"].max() - g["gps_time"].min()).total_seconds()
+
+        # Decide if we split
+        if full_duration > MAX_SEGMENT_DURATION_S:
+            t0 = g["gps_time"].iloc[0]
+            g["sub_idx"] = ((g["gps_time"] - t0).dt.total_seconds() //
+                             SUBSEGMENT_DURATION_S).astype(int)
+            sub_groups = [(f"{sid}_{si}", sub) for si, sub in g.groupby("sub_idx")]
+            funnel["subsegments_created"] += len(sub_groups)
+        else:
+            sub_groups = [(str(sid), g)]
+
+        for sub_sid, sg in sub_groups:
+            n_pts = len(sg)
+            duration = (sg["gps_time"].max() - sg["gps_time"].min()).total_seconds()
+
+            # Filter 1: minimum points
+            if n_pts < MIN_POINTS_PER_SEGMENT:
+                funnel["rejected_too_few_points"] += 1
+                continue
+            # Filter 2: minimum duration
+            if duration < MIN_SEGMENT_DURATION_S:
+                funnel["rejected_too_short"] += 1
+                continue
+
+            lon = sg["lon"].values
+            lat = sg["lat"].values
+            lat_mean = float(np.mean(lat))
+
+            # Coordinate diversity
+            n_unique_coords = len(set(zip(lon.tolist(), lat.tolist())))
+            uniqueness_ratio = n_unique_coords / n_pts
+
+            # Filter 3: minimum unique coordinates count
+            if n_unique_coords < MIN_UNIQUE_COORDS:
+                funnel["rejected_too_few_unique_coords"] += 1
+                continue
+            # Filter 4: uniqueness ratio
+            if uniqueness_ratio < MIN_UNIQUENESS_RATIO:
+                funnel["rejected_low_uniqueness"] += 1
+                continue
+
+            # Convert to meters relative to median location
+            lon_m_per_deg = M_PER_DEG_LAT * np.cos(np.radians(lat_mean))
+            x_m = (lon - np.median(lon)) * lon_m_per_deg
+            y_m = (lat - np.median(lat)) * M_PER_DEG_LAT
+
+            # Filter 5: max displacement
+            max_disp = float(np.sqrt(x_m**2 + y_m**2).max())
+            if max_disp > MAX_SEGMENT_DISPLACEMENT_M:
+                funnel["rejected_too_displaced"] += 1
+                continue
+
+            # Robust sigma estimation via MAD
+            mad_x = np.median(np.abs(x_m))
+            mad_y = np.median(np.abs(y_m))
+            sigma_x = 1.4826 * mad_x
+            sigma_y = 1.4826 * mad_y
+            sigma_pos = float(np.sqrt(sigma_x**2 + sigma_y**2))
+            std_pos = float(np.sqrt(np.var(x_m) + np.var(y_m)))
+
+            # REV-FIX(P1): the v1-PROSE estimator (radial MAD x 1.4826),
+            # computed alongside for the decisive two-statistic diagnostic.
+            sigma_radial = 1.4826 * float(np.median(np.sqrt(x_m**2 + y_m**2)))
+
+            # REV-FIX(A1-GK): worst-direction per-axis sigma via the
+            # Gnanadesikan-Kettenring robust covariance (rotation-invariant).
+            # u/v are +/-45 deg rotations of the centered coords; each MAD is
+            # taken about its own median (the median is not linear, so the
+            # rotated series are re-centered individually).
+            u_r = (x_m + y_m) / np.sqrt(2.0)
+            v_r = (x_m - y_m) / np.sqrt(2.0)
+            sigma_u = 1.4826 * float(np.median(np.abs(u_r - np.median(u_r))))
+            sigma_v = 1.4826 * float(np.median(np.abs(v_r - np.median(v_r))))
+            cov_gk = (sigma_u**2 - sigma_v**2) / 2.0
+            # Clip the implied correlation to [-1, 1] (OGK convention) so the
+            # 2x2 matrix stays PSD and lam_max <= sigma_x^2 + sigma_y^2.
+            if sigma_x > 0.0 and sigma_y > 0.0:
+                rho_gk = float(np.clip(cov_gk / (sigma_x * sigma_y), -1.0, 1.0))
+            else:
+                rho_gk = 0.0
+            cov_c = rho_gk * sigma_x * sigma_y
+            s_tr = sigma_x**2 + sigma_y**2
+            d_gap = float(np.sqrt((sigma_x**2 - sigma_y**2)**2 + 4.0 * cov_c**2))
+            sigma_gk = float(np.sqrt((s_tr + d_gap) / 2.0))
+            sigma_minor = float(np.sqrt(max(0.0, (s_tr - d_gap) / 2.0)))
+            # Major-axis orientation, math convention: deg CCW from +x (East).
+            theta_gk = float(np.degrees(0.5 * np.arctan2(2.0 * cov_c,
+                                                         sigma_x**2 - sigma_y**2)))
+
+            funnel["passed_all_filters"] += 1
+            rows.append({
+                "segment_id": sub_sid,
+                "vehicle_id": sg["vehicle_id"].iloc[0],
+                "n_points": int(n_pts),
+                "n_unique_coords": int(n_unique_coords),
+                "uniqueness_ratio": float(uniqueness_ratio),
+                "duration_s": float(duration),
+                "median_lon": float(np.median(lon)),
+                "median_lat": float(np.median(lat)),
+                "max_disp_m": float(max_disp),
+                "sigma_x_m": float(sigma_x),
+                "sigma_y_m": float(sigma_y),
+                "sigma_pos_m": sigma_pos,
+                "sigma_pos_std_m": std_pos,
+                "sigma_radial_m": sigma_radial,  # REV-FIX(P1)
+                "sigma_gk_m": sigma_gk,          # REV-FIX(A1-GK)
+                "sigma_minor_m": sigma_minor,    # REV-FIX(A1-GK)
+                "rho_gk": rho_gk,                # REV-FIX(A1-GK)
+                "theta_gk_deg": theta_gk,        # REV-FIX(A1-GK)
+                "start_time": sg["gps_time"].min(),
+                "end_time": sg["gps_time"].max(),
+                "hour_start": sg["gps_time"].min().hour,
+            })
+
+    seg_summary = pd.DataFrame(rows)
+
+    # Print filter funnel
+    logger.info(f"  Filter funnel:")
+    logger.info(f"    Total provisional segments:      {funnel['total_provisional']:,}")
+    logger.info(f"    Sub-segments created (long ones split): {funnel['subsegments_created']:,}")
+    logger.info(f"    Rejected: too few points:        {funnel['rejected_too_few_points']:,}")
+    logger.info(f"    Rejected: too short duration:    {funnel['rejected_too_short']:,}")
+    logger.info(f"    Rejected: too few unique coords: {funnel['rejected_too_few_unique_coords']:,}")
+    logger.info(f"    Rejected: low uniqueness ratio:  {funnel['rejected_low_uniqueness']:,}")
+    logger.info(f"    Rejected: too displaced:         {funnel['rejected_too_displaced']:,}")
+    logger.info(f"    Passed all filters:              {funnel['passed_all_filters']:,}")
+
+    if len(seg_summary) == 0:
+        logger.warning("  No valid segments found! Check thresholds.")
+        return seg_summary, funnel
+
+    logger.info(f"  sigma_pos: median={seg_summary['sigma_pos_m'].median():.2f}m, "
+                f"mean={seg_summary['sigma_pos_m'].mean():.2f}m, "
+                f"p95={seg_summary['sigma_pos_m'].quantile(0.95):.2f}m")
+    # REV-FIX(A1-GK)
+    logger.info(f"  sigma_gk:  median={seg_summary['sigma_gk_m'].median():.2f}m, "
+                f"mean={seg_summary['sigma_gk_m'].mean():.2f}m, "
+                f"p95={seg_summary['sigma_gk_m'].quantile(0.95):.2f}m")
+    logger.info(f"  uniqueness: median={seg_summary['uniqueness_ratio'].median():.3f}, "
+                f"min={seg_summary['uniqueness_ratio'].min():.3f}")
+    return seg_summary, funnel
+
+
+# ============================================================
+# SPATIAL AGGREGATION
+# ============================================================
+
+def aggregate_to_grid(seg_summary: pd.DataFrame, grid_size_m: int,
+                      logger) -> pd.DataFrame:
+    """Aggregate segment-level sigma_pos into spatial grid cells."""
+    if len(seg_summary) == 0:
+        return pd.DataFrame()
+
+    # Reference point for projection (city center approximation)
+    lat0 = seg_summary["median_lat"].median()
+    lon0 = seg_summary["median_lon"].median()
+
+    lon_m_per_deg = M_PER_DEG_LAT * np.cos(np.radians(lat0))
+
+    # Project to local meters
+    seg = seg_summary.copy()
+    seg["x_m"] = (seg["median_lon"] - lon0) * lon_m_per_deg
+    seg["y_m"] = (seg["median_lat"] - lat0) * M_PER_DEG_LAT
+    # REV-FIX(A1-GK): per-segment N-S dominance flag (axial theta median
+    # is ill-defined across the +/-90 deg wrap, so aggregate this instead)
+    seg["ns_dom"] = (seg["sigma_y_m"] > seg["sigma_x_m"]).astype(float)
+
+    # Bin into grid
+    seg["grid_x"] = (seg["x_m"] // grid_size_m).astype(int)
+    seg["grid_y"] = (seg["y_m"] // grid_size_m).astype(int)
+
+    # Aggregate
+    agg = seg.groupby(["grid_x", "grid_y"]).agg(
+        n_segments=("sigma_pos_m", "count"),
+        n_unique_vehicles=("vehicle_id", "nunique"),
+        sigma_pos_median=("sigma_pos_m", "median"),
+        sigma_pos_mean=("sigma_pos_m", "mean"),
+        sigma_pos_p25=("sigma_pos_m", lambda x: x.quantile(0.25)),
+        sigma_pos_p75=("sigma_pos_m", lambda x: x.quantile(0.75)),
+        sigma_pos_p95=("sigma_pos_m", lambda x: x.quantile(0.95)),
+        # REV-FIX(P1): v1-prose estimator aggregate for the diagnostic
+        sigma_radial_median=("sigma_radial_m", "median"),
+        # REV-FIX(A1-GK): worst-direction field + companions
+        sigma_gk_median=("sigma_gk_m", "median"),
+        sigma_gk_mean=("sigma_gk_m", "mean"),
+        sigma_gk_p25=("sigma_gk_m", lambda x: x.quantile(0.25)),
+        sigma_gk_p75=("sigma_gk_m", lambda x: x.quantile(0.75)),
+        sigma_gk_p95=("sigma_gk_m", lambda x: x.quantile(0.95)),
+        sigma_minor_median=("sigma_minor_m", "median"),
+        ns_dominant_share=("ns_dom", "mean"),
+        center_lon=("median_lon", "mean"),
+        center_lat=("median_lat", "mean"),
+    ).reset_index()
+
+    # Convert grid back to coords (cell centers)
+    agg["cell_lon"] = lon0 + (agg["grid_x"] + 0.5) * grid_size_m / lon_m_per_deg
+    agg["cell_lat"] = lat0 + (agg["grid_y"] + 0.5) * grid_size_m / M_PER_DEG_LAT
+    agg["grid_size_m"] = grid_size_m
+
+    logger.info(f"  Grid {grid_size_m}m: {len(agg):,} cells, "
+                f"median segments/cell={agg['n_segments'].median():.1f}")
+    return agg
+
+
+# ============================================================
+# TEMPORAL AGGREGATION
+# ============================================================
+
+def aggregate_temporal(seg_summary: pd.DataFrame, logger) -> pd.DataFrame:
+    """Aggregate sigma_pos by time of day."""
+    if len(seg_summary) == 0:
+        return pd.DataFrame()
+
+    rows = []
+    for (h0, h1), label in zip(TIME_BINS, TIME_BIN_LABELS):
+        sub = seg_summary[(seg_summary["hour_start"] >= h0) &
+                          (seg_summary["hour_start"] < h1)]
+        if len(sub) == 0:
+            rows.append({"time_bin": label, "n_segments": 0,
+                         "sigma_pos_median": np.nan, "sigma_pos_mean": np.nan,
+                         "sigma_pos_p25": np.nan, "sigma_pos_p75": np.nan,
+                         "sigma_pos_p95": np.nan})
+        else:
+            rows.append({
+                "time_bin": label,
+                "n_segments": len(sub),
+                "sigma_pos_median": sub["sigma_pos_m"].median(),
+                "sigma_pos_mean": sub["sigma_pos_m"].mean(),
+                "sigma_pos_p25": sub["sigma_pos_m"].quantile(0.25),
+                "sigma_pos_p75": sub["sigma_pos_m"].quantile(0.75),
+                "sigma_pos_p95": sub["sigma_pos_m"].quantile(0.95),
+            })
+    out = pd.DataFrame(rows)
+    return out
+
+
+# ============================================================
+# DATA QUALITY DIAGNOSTICS
+# ============================================================
+
+def compute_data_quality(df: pd.DataFrame, seg_summary: pd.DataFrame, logger) -> dict:
+    """Diagnostics about the input data quality."""
+    # Sampling interval
+    df_sorted = df.sort_values(["vehicle_id", "gps_time"])
+    dt = df_sorted.groupby("vehicle_id")["gps_time"].diff().dt.total_seconds()
+    dt_valid = dt.dropna()
+
+    quality = {
+        "n_total_records": int(len(df)),
+        "n_unique_vehicles": int(df["vehicle_id"].nunique()),
+        "time_span_h": float((df["gps_time"].max() - df["gps_time"].min()).total_seconds() / 3600),
+        "lon_min": float(df["lon"].min()),
+        "lon_max": float(df["lon"].max()),
+        "lat_min": float(df["lat"].min()),
+        "lat_max": float(df["lat"].max()),
+        "spatial_span_ew_km": float((df["lon"].max() - df["lon"].min()) *
+                                     M_PER_DEG_LAT * np.cos(np.radians(df["lat"].mean())) / 1000),
+        "spatial_span_ns_km": float((df["lat"].max() - df["lat"].min()) * M_PER_DEG_LAT / 1000),
+        "sampling_interval_p25_s": float(dt_valid.quantile(0.25)),
+        "sampling_interval_p50_s": float(dt_valid.quantile(0.50)),
+        "sampling_interval_p75_s": float(dt_valid.quantile(0.75)),
+        "frac_records_speed_zero": float((df["speed_kmh"] == 0).mean()),
+        "frac_records_speed_lt5": float((df["speed_kmh"] < 5).mean()),
+        "n_valid_segments": int(len(seg_summary)),
+    }
+    if len(seg_summary) > 0:
+        quality.update({
+            "sigma_pos_median_m": float(seg_summary["sigma_pos_m"].median()),
+            "sigma_gk_median_m": float(seg_summary["sigma_gk_m"].median()),  # REV-FIX(A1-GK)
+            "sigma_pos_mean_m": float(seg_summary["sigma_pos_m"].mean()),
+            "sigma_pos_p95_m": float(seg_summary["sigma_pos_m"].quantile(0.95)),
+            "sigma_pos_min_m": float(seg_summary["sigma_pos_m"].min()),
+            "sigma_pos_max_m": float(seg_summary["sigma_pos_m"].max()),
+            "frac_segments_in_reasonable_range": float(
+                ((seg_summary["sigma_pos_m"] >= SIGMA_POS_REASONABLE_RANGE_M[0]) &
+                 (seg_summary["sigma_pos_m"] <= SIGMA_POS_REASONABLE_RANGE_M[1])).mean()
+            ),
+        })
+    return quality
+
+
+# ============================================================
+# VISUALIZATION
+# ============================================================
+
+def make_figures(seg_summary: pd.DataFrame, grid_dfs: dict,
+                 temporal_df: pd.DataFrame, fig_dir: Path, city: str,
+                 logger, funnel: dict = None):
+    """Generate diagnostic figures saved as PNG."""
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    # Always plot filter funnel if available, even if no segments survived
+    if funnel is not None:
+        try:
+            fig, ax = plt.subplots(figsize=(10, 5))
+            stages = [
+                ("Provisional", funnel["total_provisional"]),
+                ("Sub-segments\n(after split)",
+                    funnel["total_provisional"] + funnel["subsegments_created"]
+                    - sum(1 for _ in [funnel["total_provisional"]] if _)),  # informational
+                ("Pass: enough pts",
+                    funnel["total_provisional"] + funnel["subsegments_created"]
+                    - funnel["rejected_too_few_points"]),
+                ("Pass: long enough",
+                    funnel["total_provisional"] + funnel["subsegments_created"]
+                    - funnel["rejected_too_few_points"]
+                    - funnel["rejected_too_short"]),
+                ("Pass: enough\nunique coords",
+                    funnel["total_provisional"] + funnel["subsegments_created"]
+                    - funnel["rejected_too_few_points"]
+                    - funnel["rejected_too_short"]
+                    - funnel["rejected_too_few_unique_coords"]),
+                ("Pass: high\nuniqueness",
+                    funnel["total_provisional"] + funnel["subsegments_created"]
+                    - funnel["rejected_too_few_points"]
+                    - funnel["rejected_too_short"]
+                    - funnel["rejected_too_few_unique_coords"]
+                    - funnel["rejected_low_uniqueness"]),
+                ("FINAL: passed\ndisplacement",
+                    funnel["passed_all_filters"]),
+            ]
+            labels = [s[0] for s in stages]
+            counts = [s[1] for s in stages]
+            colors = ["#4393C3"] * (len(stages) - 1) + ["#2166AC"]
+            bars = ax.bar(labels, counts, color=colors, edgecolor="white")
+            for bar, c in zip(bars, counts):
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                        f"{c:,}", ha="center", va="bottom", fontsize=9)
+            ax.set_ylabel("Number of segments")
+            ax.set_title(f"({city}) Filter funnel: provisional → valid")
+            ax.tick_params(axis="x", rotation=0, labelsize=8)
+            ax.grid(alpha=0.3, axis="y")
+            plt.tight_layout()
+            plt.savefig(fig_dir / "fig6_filter_funnel.png", dpi=150)
+            plt.close()
+        except Exception as e:
+            logger.warning(f"Could not draw funnel: {e}")
+
+    if len(seg_summary) == 0:
+        logger.warning("No segments to plot.")
+        return
+
+    # ---- Fig 1: sigma_pos distribution ----
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+
+    ax = axes[0]
+    sigma = seg_summary["sigma_pos_m"].clip(0, 50)
+    ax.hist(sigma, bins=60, color="#4393C3", edgecolor="white")
+    ax.axvline(sigma.median(), color="red", linestyle="--",
+               label=f"Median = {sigma.median():.2f}m")
+    ax.axvline(sigma.mean(), color="orange", linestyle="--",
+               label=f"Mean = {sigma.mean():.2f}m")
+    ax.set_xlabel("sigma_pos (m)")
+    ax.set_ylabel("Count")
+    ax.set_title(f"({city}) Segment-level sigma_pos distribution\n"
+                 f"N = {len(seg_summary):,} stationary segments")
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    ax = axes[1]
+    ax.hist(np.log10(seg_summary["sigma_pos_m"].clip(lower=0.01)),
+            bins=60, color="#4393C3", edgecolor="white")
+    ax.set_xlabel("log10(sigma_pos)  [m]")
+    ax.set_ylabel("Count")
+    ax.set_title("Log scale for tail visibility")
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(fig_dir / "fig1_sigma_pos_distribution.png", dpi=150)
+    plt.close()
+
+    # ---- Fig 2: spatial heatmap (100m grid) ----
+    if 100 in grid_dfs and len(grid_dfs[100]) > 0:
+        agg = grid_dfs[100]
+        fig, ax = plt.subplots(figsize=(9, 8))
+        # Use only cells with enough segments
+        agg_plot = agg[agg["n_segments"] >= 3]
+        if len(agg_plot) > 0:
+            sc = ax.scatter(agg_plot["cell_lon"], agg_plot["cell_lat"],
+                            c=agg_plot["sigma_pos_median"].clip(0, 20),
+                            s=10, cmap="RdYlGn_r", marker="s")
+            plt.colorbar(sc, ax=ax, label="Median sigma_pos (m)")
+            ax.set_xlabel("Longitude")
+            ax.set_ylabel("Latitude")
+            ax.set_title(f"({city}) 100m grid: median sigma_pos\n"
+                         f"({len(agg_plot):,} cells with ≥3 segments)")
+            ax.set_aspect("equal", adjustable="datalim")
+            ax.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(fig_dir / "fig2_spatial_heatmap_100m.png", dpi=150)
+        plt.close()
+
+    # ---- Fig 3: temporal pattern ----
+    if len(temporal_df) > 0:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        x = np.arange(len(temporal_df))
+        ax.plot(x, temporal_df["sigma_pos_median"], "o-", color="#2166AC",
+                linewidth=2, markersize=8, label="Median")
+        ax.fill_between(x, temporal_df["sigma_pos_p25"],
+                        temporal_df["sigma_pos_p75"],
+                        alpha=0.25, color="#2166AC", label="IQR")
+        ax.plot(x, temporal_df["sigma_pos_p95"], "s--", color="#B2182B",
+                alpha=0.7, label="P95")
+        ax.set_xticks(x)
+        ax.set_xticklabels(temporal_df["time_bin"])
+        ax.set_xlabel("Time of day (hour)")
+        ax.set_ylabel("sigma_pos (m)")
+        ax.set_title(f"({city}) Temporal pattern of sigma_pos")
+        ax.legend()
+        ax.grid(alpha=0.3)
+        # Add segment counts as secondary info
+        for i, n in enumerate(temporal_df["n_segments"]):
+            ax.annotate(f"n={n}", (i, temporal_df["sigma_pos_median"].iloc[i]),
+                        textcoords="offset points", xytext=(0, 10),
+                        fontsize=8, ha="center", color="gray")
+        plt.tight_layout()
+        plt.savefig(fig_dir / "fig3_temporal_pattern.png", dpi=150)
+        plt.close()
+
+    # ---- Fig 4: segment quality (n_points vs duration) ----
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    ax = axes[0]
+    ax.scatter(seg_summary["n_points"], seg_summary["sigma_pos_m"].clip(0, 30),
+               alpha=0.3, s=10)
+    ax.set_xlabel("Number of GPS points in segment")
+    ax.set_ylabel("sigma_pos (m, clipped at 30)")
+    ax.set_title("Segment size vs. estimated sigma_pos")
+    ax.grid(alpha=0.3)
+    ax.set_xscale("log")
+
+    ax = axes[1]
+    ax.scatter(seg_summary["duration_s"] / 60, seg_summary["sigma_pos_m"].clip(0, 30),
+               alpha=0.3, s=10)
+    ax.set_xlabel("Segment duration (minutes)")
+    ax.set_ylabel("sigma_pos (m, clipped at 30)")
+    ax.set_title("Duration vs. estimated sigma_pos")
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(fig_dir / "fig4_segment_quality.png", dpi=150)
+    plt.close()
+
+    # ---- Fig 5: robust vs non-robust comparison ----
+    fig, ax = plt.subplots(figsize=(7, 6))
+    valid = seg_summary[(seg_summary["sigma_pos_m"] < 50) &
+                        (seg_summary["sigma_pos_std_m"] < 50)]
+    ax.scatter(valid["sigma_pos_m"], valid["sigma_pos_std_m"],
+               alpha=0.3, s=10)
+    lim = max(valid["sigma_pos_m"].max(), valid["sigma_pos_std_m"].max())
+    ax.plot([0, lim], [0, lim], "r--", linewidth=1)
+    ax.set_xlabel("sigma_pos (MAD-based, robust)")
+    ax.set_ylabel("sigma_pos (std-based, non-robust)")
+    ax.set_title("Robust vs non-robust sigma estimate\n(divergence indicates outliers/jumps)")
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(fig_dir / "fig5_robust_vs_std.png", dpi=150)
+    plt.close()
+
+    logger.info(f"  Figures saved to {fig_dir}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def run_poc(city: str, data_root: Path, out_root: Path,
+            streaming_threshold_gb: float = 6.0):
+    """Run full PoC pipeline for one city.
+
+    Memory strategy:
+    - If estimated dataset size <= streaming_threshold_gb (default 6 GB),
+      use the simple "load all + process" mode (faster, simpler).
+    - If larger, switch to streaming mode: load files, partition by
+      vehicle_id, then process vehicles in batches of ~5000 at a time.
+      Memory peak is bounded by the largest single file plus
+      one batch of vehicles.
+    """
+    city_dir = data_root / city
+    out_dir = out_root / f"poc_{city}"
+
+    if out_dir.exists():
+        print(f"[INFO] Removing existing {out_dir}")
+        shutil.rmtree(out_dir)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "stats").mkdir(exist_ok=True)
+    (out_dir / "figures").mkdir(exist_ok=True)
+    (out_dir / "intermediate").mkdir(exist_ok=True)
+
+    logger = setup_logger(out_dir)
+    logger.info(f"========== PoC starting for city: {city} ==========")
+    logger.info(f"Data dir: {city_dir}")
+    logger.info(f"Output dir: {out_dir}")
+    logger.info(f"Run started at {datetime.now().isoformat()}")
+    if _HAS_PSUTIL:
+        logger.info(f"Memory monitoring: enabled (psutil available)")
+    else:
+        logger.info(f"Memory monitoring: disabled (install psutil for memory tracking)")
+
+    # Estimate dataset size to choose pipeline mode
+    size_info = estimate_dataset_size(city_dir, logger)
+    use_streaming = size_info["estimated_mem_gb_full_load"] > streaming_threshold_gb
+    if use_streaming:
+        logger.info(f"  -> STREAMING mode (data > {streaming_threshold_gb} GB threshold)")
+    else:
+        logger.info(f"  -> SIMPLE mode (data <= {streaming_threshold_gb} GB threshold)")
+
+    # Save dataset size info immediately (useful even if pipeline crashes later)
+    with open(out_dir / "stats" / "dataset_size.json", "w") as f:
+        json.dump({**size_info, "mode": "streaming" if use_streaming else "simple"},
+                   f, indent=2)
+
+    if use_streaming:
+        seg_summary, funnel, df_summary = run_streaming_pipeline(city_dir, logger)
+    else:
+        df = load_city_data(city_dir, logger)
+        seg_df = detect_stationary_segments(df, logger)
+        seg_summary, funnel = compute_segment_sigma_pos(seg_df, logger)
+        df_summary = compute_data_quality(df, seg_summary, logger)
+        del df, seg_df
+        gc.collect()
+
+    # Save filter funnel
+    with open(out_dir / "stats" / "filter_funnel.json", "w") as f:
+        json.dump(funnel, f, indent=2)
+
+    if len(seg_summary) == 0:
+        logger.error("No valid segments found - check thresholds or data quality")
+        with open(out_dir / "stats" / "data_quality.json", "w") as f:
+            json.dump(df_summary, f, indent=2, default=str)
+        return
+
+    # Save segment-level data (anonymized)
+    seg_summary_anon = seg_summary.copy()
+    seg_summary_anon["vehicle_id"] = seg_summary_anon["vehicle_id"].apply(
+        lambda v: f"v{hash(str(v)) % 10**8:08d}"
+    )
+    seg_summary_anon.to_parquet(out_dir / "intermediate" / "segments.parquet",
+                                 index=False)
+    logger.info(f"  Saved {len(seg_summary_anon):,} segments to intermediate/")
+
+    # Spatial aggregation
+    grid_dfs = {}
+    for gs in GRID_SIZES_M:
+        agg = aggregate_to_grid(seg_summary, gs, logger)
+        agg.to_parquet(out_dir / "intermediate" / f"grid_{gs}m.parquet",
+                       index=False)
+        grid_dfs[gs] = agg
+
+    # Temporal aggregation
+    temporal_df = aggregate_temporal(seg_summary, logger)
+    temporal_df.to_csv(out_dir / "stats" / "temporal_pattern.csv", index=False)
+
+    # Save data quality summary
+    with open(out_dir / "stats" / "data_quality.json", "w") as f:
+        json.dump(df_summary, f, indent=2, default=str)
+
+    # Sigma quantiles
+    quantiles = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]
+    sigma_quantiles = {f"q{int(q*100):02d}": float(seg_summary["sigma_pos_m"].quantile(q))
+                       for q in quantiles}
+    with open(out_dir / "stats" / "sigma_pos_quantiles.json", "w") as f:
+        json.dump(sigma_quantiles, f, indent=2)
+
+    # Figures
+    make_figures(seg_summary, grid_dfs, temporal_df,
+                 out_dir / "figures", city, logger, funnel=funnel)
+
+    # Final summary printout
+    logger.info("\n" + "="*60)
+    logger.info(f"FINAL SUMMARY for {city}:")
+    logger.info(f"  Records:  {df_summary['n_total_records']:,}")
+    logger.info(f"  Vehicles: {df_summary['n_unique_vehicles']:,}")
+    logger.info(f"  Stationary segments (valid): {df_summary['n_valid_segments']:,}")
+    if df_summary['n_valid_segments'] > 0:
+        logger.info(f"  sigma_pos median:  {df_summary['sigma_pos_median_m']:.2f}m")
+        logger.info(f"  sigma_pos p95:     {df_summary['sigma_pos_p95_m']:.2f}m")
+        logger.info(f"  Reasonable range:  {df_summary['frac_segments_in_reasonable_range']*100:.1f}%")
+    logger.info(f"  Output:   {out_dir}")
+    logger.info("="*60)
+
+
+def run_streaming_pipeline(city_dir: Path, logger,
+                            vehicles_per_batch: int = 5000) -> tuple:
+    """Memory-bounded pipeline for large multi-day datasets.
+
+    Strategy:
+      1. Load all parquet files (this still requires ~1× full data in mem briefly)
+      2. Get unique vehicle_ids
+      3. Process vehicles in batches of ~5000 at a time:
+         - Filter df to current batch's vehicles
+         - Detect segments + compute sigma for those vehicles
+         - Append to running results
+         - Drop the batch slice to free memory
+
+    Returns: (seg_summary, funnel, summary_dict)
+    """
+    logger.info("=== Starting streaming pipeline ===")
+
+    # Load all data (this is the main memory peak; we keep df slim)
+    files = find_parquet_files(city_dir)
+    logger.info(f"Loading {len(files)} parquet files...")
+    dfs = []
+    for i, f in enumerate(files):
+        df_chunk = load_one_file(f)
+        # Keep only essential columns to save memory
+        keep_cols = [c for c in ["vehicle_id", "lon", "lat", "speed_kmh", "gps_time"]
+                     if c in df_chunk.columns]
+        df_chunk = df_chunk[keep_cols]
+        dfs.append(df_chunk)
+        mem = _mem_mb()
+        mem_str = f", mem={mem:.0f}MB" if mem else ""
+        logger.info(f"  [{i+1}/{len(files)}] loaded {f.name}: "
+                    f"{len(df_chunk):,} rows{mem_str}")
+
+    df = pd.concat(dfs, ignore_index=True)
+    del dfs
+    gc.collect()
+
+    n_total = len(df)
+    n_vehicles = df.vehicle_id.nunique()
+    time_min = df.gps_time.min()
+    time_max = df.gps_time.max()
+    logger.info(f"Total: {n_total:,} records, {n_vehicles:,} vehicles, "
+                f"time {time_min} to {time_max}")
+    mem = _mem_mb()
+    if mem:
+        logger.info(f"Memory after concat: {mem:.0f}MB")
+
+    # Sort by vehicle and time so vehicle batches are contiguous
+    logger.info("Sorting by vehicle_id, gps_time (this can take a few minutes)...")
+    df = df.sort_values(["vehicle_id", "gps_time"]).reset_index(drop=True)
+    gc.collect()
+
+    # Get all unique vehicles
+    all_vehicles = df.vehicle_id.unique()
+    logger.info(f"Processing {len(all_vehicles):,} vehicles in batches of {vehicles_per_batch}")
+
+    # Process in batches
+    all_seg_summaries = []
+    combined_funnel = {
+        "total_provisional": 0, "subsegments_created": 0,
+        "rejected_too_few_points": 0, "rejected_too_short": 0,
+        "rejected_too_displaced": 0, "rejected_low_uniqueness": 0,
+        "rejected_too_few_unique_coords": 0, "passed_all_filters": 0,
+    }
+
+    n_batches = (len(all_vehicles) + vehicles_per_batch - 1) // vehicles_per_batch
+    for bi in range(n_batches):
+        start = bi * vehicles_per_batch
+        end = min((bi + 1) * vehicles_per_batch, len(all_vehicles))
+        batch_vehicles = all_vehicles[start:end]
+        sub_df = df[df.vehicle_id.isin(set(batch_vehicles))].copy()
+
+        if len(sub_df) == 0:
+            continue
+
+        # Run segment detection + sigma computation on this batch only
+        seg_df_batch = detect_stationary_segments(sub_df, logger)
+        seg_summary_batch, funnel_batch = compute_segment_sigma_pos(seg_df_batch, logger)
+
+        # Accumulate
+        if len(seg_summary_batch) > 0:
+            all_seg_summaries.append(seg_summary_batch)
+        for k in combined_funnel:
+            combined_funnel[k] += funnel_batch.get(k, 0)
+
+        del sub_df, seg_df_batch, seg_summary_batch
+        gc.collect()
+        mem = _mem_mb()
+        mem_str = f", mem={mem:.0f}MB" if mem else ""
+        n_so_far = sum(len(s) for s in all_seg_summaries)
+        logger.info(f"  Batch [{bi+1}/{n_batches}]: vehicles {start}-{end}, "
+                    f"{n_so_far:,} valid segments accumulated{mem_str}")
+
+    # Combine batch results
+    if all_seg_summaries:
+        seg_summary = pd.concat(all_seg_summaries, ignore_index=True)
+    else:
+        seg_summary = pd.DataFrame()
+
+    # Build summary dict (don't compute distances etc on raw df beyond basics)
+    summary = {
+        "n_total_records": int(n_total),
+        "n_unique_vehicles": int(n_vehicles),
+        "time_span_h": float((time_max - time_min).total_seconds() / 3600),
+        "lon_min": float(df.lon.min()),
+        "lon_max": float(df.lon.max()),
+        "lat_min": float(df.lat.min()),
+        "lat_max": float(df.lat.max()),
+        "n_valid_segments": int(len(seg_summary)),
+    }
+    # Sampling intervals from a sample to avoid full-df pass
+    sample_size = min(2_000_000, len(df))
+    df_sample = df.sample(sample_size, random_state=42).sort_values(
+        ["vehicle_id", "gps_time"])
+    dt = df_sample.groupby("vehicle_id")["gps_time"].diff().dt.total_seconds().dropna()
+    if len(dt) > 0:
+        summary["sampling_interval_p25_s"] = float(dt.quantile(0.25))
+        summary["sampling_interval_p50_s"] = float(dt.quantile(0.50))
+        summary["sampling_interval_p75_s"] = float(dt.quantile(0.75))
+    summary["frac_records_speed_zero"] = float((df["speed_kmh"] == 0).mean())
+    summary["frac_records_speed_lt5"] = float((df["speed_kmh"] < 5).mean())
+
+    if len(seg_summary) > 0:
+        summary["sigma_pos_median_m"] = float(seg_summary.sigma_pos_m.median())
+        summary["sigma_gk_median_m"] = float(seg_summary.sigma_gk_m.median())  # REV-FIX(A1-GK)
+        summary["sigma_pos_mean_m"] = float(seg_summary.sigma_pos_m.mean())
+        summary["sigma_pos_p95_m"] = float(seg_summary.sigma_pos_m.quantile(0.95))
+        summary["sigma_pos_min_m"] = float(seg_summary.sigma_pos_m.min())
+        summary["sigma_pos_max_m"] = float(seg_summary.sigma_pos_m.max())
+        summary["frac_segments_in_reasonable_range"] = float(
+            ((seg_summary.sigma_pos_m >= SIGMA_POS_REASONABLE_RANGE_M[0]) &
+             (seg_summary.sigma_pos_m <= SIGMA_POS_REASONABLE_RANGE_M[1])).mean()
+        )
+
+    del df
+    gc.collect()
+    return seg_summary, combined_funnel, summary
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="PoC: extract sigma_pos from taxi GPS. "
+                    "Without --city, processes all subfolders in data-root.")
+    parser.add_argument("--city", default=None,
+                        help="(Optional) City folder name. "
+                             "If omitted, processes ALL subfolders in city_data/.")
+    parser.add_argument("--data-root", default="../city_data",
+                        help="Root dir containing city subdirs")
+    parser.add_argument("--out-root", default="../output",
+                        help="Root dir for output")
+    parser.add_argument("--streaming-threshold-gb", type=float, default=6.0,
+                        help="Estimated dataset size (GB) above which to use "
+                             "streaming mode (default 6.0)")
+    args = parser.parse_args()
+
+    data_root = Path(args.data_root).resolve()
+    out_root = Path(args.out_root).resolve()
+    if not data_root.exists():
+        sys.exit(f"data-root {data_root} does not exist")
+
+    # Determine list of cities to run
+    if args.city is not None:
+        cities = [args.city]
+    else:
+        # Auto-discover: every subfolder of data_root that contains parquet files
+        # (recursive, so per-day subfolders within a city also count)
+        cities = []
+        for sub in sorted(data_root.iterdir()):
+            if sub.is_dir() and any(sub.rglob("*.parquet")):
+                cities.append(sub.name)
+        if not cities:
+            sys.exit(f"No city subfolders with parquet files found in {data_root}")
+        print(f"\n[BATCH MODE] Found {len(cities)} cities: {cities}\n")
+
+    failed = []
+    for i, city in enumerate(cities):
+        if len(cities) > 1:
+            print(f"\n{'#'*70}")
+            print(f"# [{i+1}/{len(cities)}] Processing city: {city}")
+            print(f"{'#'*70}")
+        try:
+            run_poc(city, data_root, out_root,
+                     streaming_threshold_gb=args.streaming_threshold_gb)
+        except Exception as e:
+            failed.append(city)
+            print(f"[BATCH] {city} failed with: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"[BATCH] Continuing with next city...")
+
+    if len(cities) > 1:
+        print(f"\n{'='*70}")
+        print(f"BATCH SUMMARY: {len(cities)-len(failed)}/{len(cities)} cities succeeded")
+        if failed:
+            print(f"  Failed: {failed}")
+        print('='*70)
+
+
+if __name__ == "__main__":
+    main()

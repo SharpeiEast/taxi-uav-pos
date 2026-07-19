@@ -1,0 +1,15 @@
+{
+  "lambda_fit": {
+    "n_segments": 78,
+    "lambda_median": 2.5503046438175545,
+    "lambda_p25": 1.678287706139925,
+    "lambda_p75": 7.682264688085037,
+    "lambda_p95": 17.761837179760697,
+    "source": "UrbanNav E-8 receiver-class tmin30 segments"
+  },
+  "eterm0_kJ": 30.25917670491019,
+  "beta_anchor_q50_range": [
+    0.4360667147527541,
+    1.0
+  ]
+}
