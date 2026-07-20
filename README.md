@@ -51,9 +51,29 @@ a maximal covering charging-station location model.
                reported in the paper as the upper-bound scenario.
 
 ## Environment
-Python 3.12, numpy/scipy/pandas, gurobipy (Gurobi 12; academic license),
-R 4.x with ggplot2 for figures. Each script is standalone; paths are set
-at the top of each file.
+Tested with Python 3.12.7, numpy 2.4.4, scipy 1.16.3, pandas 2.3.3,
+gurobipy 12.0.1 (Gurobi 12.0.1, academic license), and R 4.x with
+ggplot2 for figures. Exact Python pins are in `requirements.txt`.
+Verification scripts additionally use Wolfram Engine 14.3
+(`wolframscript -file`) and MATLAB R2025a; both are optional and
+independent of the Python pipeline. Each script is standalone; paths
+are set at the top of each file.
+
+## Entry point
+To reproduce the headline tables from the shipped field and instance,
+run the `code/pipeline/` stages in the order listed above
+(r2_prep -> r2_fields -> r2_eterm -> r2_reach -> r2_milp), then the
+`code/cs511/` drivers for the screened-511 headline results. Each
+stage writes its outputs next to its inputs; `results/` contains the
+frozen reference outputs to compare against.
+
+## Runtime and hardware
+The full chain was run on dual-socket Xeon 8358 nodes (64 cores,
+256 GB). Approximate wall times: cost-field Dijkstra sweep (605
+sources on a 1.05M-node grid) ~2 h on 64 cores; one MILP sweep
+(4 reserve levels x 3 demand models) ~30 min; the bootstrap ensemble
+(240 MILPs) ~6 h. A 16-core / 64 GB machine suffices for any single
+stage at longer wall times.
 
 ## Configuration
 `code/pipeline/r2_config.py` is the frozen headline configuration
