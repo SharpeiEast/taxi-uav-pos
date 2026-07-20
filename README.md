@@ -38,8 +38,15 @@ a maximal covering charging-station location model.
 - `verification/` Independent verification scripts: exact
                quantifier-elimination certificate of the per-metre
                energy monotonicity (Wolfram), symbolic model-identity
-               checks (Wolfram), and coverage cross-checks with a
-               greedy--IP--LP sandwich (MATLAB).
+               checks (Wolfram), coverage cross-checks with a
+               greedy--IP--LP sandwich (MATLAB), a full-model audit in
+               Wolfram (`full_audit.wl`) and, independently, in Julia
+               (`full_audit.jl`: physics/terminal/probability layer plus
+               structural checks on every frozen result row), and a
+               fresh MILP re-certification (`milp_recheck.py`: headline
+               re-solves, the fixed-radius baseline rebuilt from
+               coordinates, and the imputed-node saturation audit).
+               Julia scripts were run with Julia 1.11.7.
 - `results/`   Frozen output tables behind the reported results.
                `cs511/` holds the headline (screened 511-site) tables:
                MILP sweep per demand model and rho, three-class
