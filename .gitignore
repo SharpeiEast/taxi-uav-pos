@@ -1,0 +1,19 @@
+# This repository holds code and aggregated data only.
+# Manuscript sources and build artefacts are kept out.
+*.tex
+*.bib
+*.pdf
+*.cls
+*.bst
+*.sty
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.synctex.gz
+
+# Local artefacts
+__pycache__/
+*.pyc
+.DS_Store
